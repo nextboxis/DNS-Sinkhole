@@ -72,7 +72,7 @@ The frontend is a hacker-themed, hardware-accelerated SPA featuring:
 
 ### 1. Initialize Workspace
 ```bash
-git clone https://github.com/your-username/DNS-sinkhole.git
+git clone https://github.com/nextboxis/DNS-sinkhole.git
 cd DNS-sinkhole
 ```
 
