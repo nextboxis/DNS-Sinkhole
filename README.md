@@ -27,20 +27,6 @@
   <i>DNS Sinkhole provides a premium, tactical control surface for intercepting, analyzing, and persisting live DNS traffic telemetry and malicious PCAP artifacts.</i>
 </p>
 
----
-
-## 📸 Visual Intelligence Surface
-
-<div align="center">
-  <img src="file:///C:/Users/GIRID/.gemini/antigravity/brain/abdbba5f-eddc-4d4a-b91b-2b5d00001631/dns_sinkhole_desktop_top_1774498051682.png" width="100%" alt="Dashboard Top Interface" />
-  <p><i>Fig 1.0: Real-time Metric Surveillance & Live Insight Grid</i></p>
-  
-  <br />
-  
-  <img src="file:///C:/Users/GIRID/.gemini/antigravity/brain/abdbba5f-eddc-4d4a-b91b-2b5d00001631/dns_events_table_desktop_1774498071184.png" width="100%" alt="Captured DNS Events Table" />
-  <p><i>Fig 1.1: Multi-Protocol Timeline with Selective Data Export</i></p>
-</div>
-
 ## ⚡ System Capabilities
 
 `DNS Sinkhole` is built to replace heavy SIEM environments when all you need is lightning-fast, highly contextualized DNS analysis.
