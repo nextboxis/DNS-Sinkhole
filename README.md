@@ -26,6 +26,7 @@
 <p align="center">
   <i>DNS Sinkhole provides a premium, tactical control surface for intercepting, analyzing, and persisting live DNS traffic telemetry and malicious PCAP artifacts.</i>
 </p>
+---
 
 ## ⚡ System Capabilities
 
@@ -62,7 +63,12 @@ The frontend is a hacker-themed, hardware-accelerated SPA featuring:
 
 ---
 
-## 🚀 Deployment Vector
+## 🚀 Quick Start & Deployment
+
+### 📋 Prerequisites
+*   Python 3.10 or higher
+*   MongoDB (optional, for persistent storage)
+*   Sudo/Admin privileges (for live packet capture)
 
 ### 1. Initialize Workspace
 ```bash
@@ -87,6 +93,36 @@ python3 app.py
 ```
 > **TARGET ACQUIRED:** Navigate to `http://localhost:3000` to access the console.
 
+---
+
+## 🐧 Linux Intelligence Setup (Step-by-Step)
+
+For high-performance tactical capture on Linux (Ubuntu/Debian/Kali), follow these precise vectors:
+
+### 1. Hardening Dependencies
+Ensure the system has the necessary headers for raw packet manipulation and native interface bindings:
+```bash
+sudo apt update
+sudo apt install -y python3-dev libpcap-dev tshark
+```
+
+### 2. Capability Provisioning (Optional but Recommended)
+To allow the sniffer to bind to raw interfaces without requiring `root` or `sudo` every time, grant the Python binary capture capabilities:
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip $(readlink -f $(which python3))
+```
+
+### 3. Service Orchestration
+If using **MongoDB** for persistence, ensure the service is active and the URI in the dashboard matches your local instance:
+```bash
+sudo systemctl enable --now mongod
+```
+
+### 4. Headless Execution
+For server environments where a GUI is unavailable, you can stream the monitor output directly to a background process:
+```bash
+nohup python3 app.py > console.log 2>&1 &
+```
 ---
 
 ## 🛠️ Toolchain Modules
