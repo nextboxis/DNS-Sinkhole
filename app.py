@@ -3,22 +3,29 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+try:
+    import psutil  # type: ignore[import]
+except ImportError:  # type: ignore[import]
+    psutil = None  # type: ignore[assignment]
 from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from flask import Flask, jsonify, request, send_from_directory, Response  # pyre-ignore
+from flask import Flask, jsonify, request, send_from_directory, Response  # type: ignore[import]
 from werkzeug.utils import secure_filename  # pyre-ignore
 
 
 APP_ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = APP_ROOT / "public"
 DEFAULT_PORT = int(os.getenv("PORT", "3000"))
-UPLOAD_DIR = Path("/tmp/dns_sinkhole_uploads")
+# Use user's temp directory if /tmp is not available or writable (on Windows)
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "dns_sinkhole_uploads"
+HISTORY_FILE = APP_ROOT / "session_history.json"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -47,14 +54,15 @@ class CaptureManager:
         self.root = root
         self.monitor_script = root / "scripts" / "dns_monitor.py"
         self.lock = threading.RLock()
-        self.events = deque(maxlen=max_events)
-        self.activity = deque(maxlen=max_activity)
-        self.subscribers: List[Queue] = []
-        self.process: Optional[subprocess.Popen] = None
+        self.events: deque[Dict[str, Any]] = deque(maxlen=max_events)
+        self.activity: deque[Dict[str, str]] = deque(maxlen=max_activity)
+        self.subscribers: List[Queue[Tuple[str, Dict[str, Any]]]] = []
+        self.history = self._load_history()
+        self.process: Optional[subprocess.Popen[str]] = None
         self.worker: Optional[threading.Thread] = None
         self.stop_requested = False
         self.sequence = 0
-        self.session = self._idle_session()
+        self.session: Dict[str, Any] = self._idle_session()
 
     def _default_config(self) -> Dict[str, Any]:
         return {
@@ -66,6 +74,8 @@ class CaptureManager:
             "mongoDb": "dns_sinkhole",
             "mongoCollection": "dns_events",
             "limit": 0,
+            "sinkholeIp": "",
+            "scanTarget": "",
         }
 
     def _idle_session(self) -> Dict[str, Any]:
@@ -103,7 +113,7 @@ class CaptureManager:
     def _push_error_locked(self, message: str) -> None:
         errors = cast(List[str], list(self.session.get("errors", [])))
         errors.append(message)
-        self.session["errors"] = [e for i, e in enumerate(errors) if i >= len(errors) - 6]
+        self.session["errors"] = errors[-6:]
         self._add_activity_locked(message, "error")
 
     def _search_match(self, event: Dict[str, Any], term: str) -> bool:
@@ -158,11 +168,33 @@ class CaptureManager:
             "eventsPerMinute": events_per_minute,
             "transportBreakdown": dict(transports),
             "recentActivity": list(self.activity),
+            "historyCount": len(self.history),
         }
+
+    def _load_history(self) -> List[Dict[str, Any]]:
+        try:
+            if HISTORY_FILE.exists():
+                return json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            pass
+        return []
+
+    def _save_history(self) -> None:
+        try:
+            HISTORY_FILE.write_text(json.dumps(self.history[:50], indent=2))
+        except Exception:
+            pass
+
+    def reset_dashboard(self) -> Dict[str, Any]:
+        with self.lock:
+            self.events.clear()
+            self.activity.clear()
+            self._add_activity_locked("Dashboard reset. Buffers cleared.", "info")
+            return self.snapshot()
 
     def snapshot(self, search: str = "", limit: int = 0) -> Dict[str, Any]:
         with self.lock:
-            events = cast(List[Dict[str, Any]], list(self.events))
+            events = list(self.events)
             if search:
                 term = search.strip().lower()
                 events = [event for event in events if self._search_match(event, term)]
@@ -182,7 +214,7 @@ class CaptureManager:
         }
 
     def _broadcast(self, event_name: str, payload: Dict[str, Any]) -> None:
-        stale: List[Queue] = []
+        stale: List[Queue[Tuple[str, Dict[str, Any]]]] = []
         with self.lock:
             subscribers = list(self.subscribers)
 
@@ -198,13 +230,13 @@ class CaptureManager:
                     if subscriber in self.subscribers:
                         self.subscribers.remove(subscriber)
 
-    def subscribe(self) -> Queue:
-        queue: Queue = Queue(maxsize=64)
+    def subscribe(self) -> Queue[Tuple[str, Dict[str, Any]]]:
+        queue: Queue[Tuple[str, Dict[str, Any]]] = Queue(maxsize=64)
         with self.lock:
             self.subscribers.append(queue)
         return queue
 
-    def unsubscribe(self, queue: Queue) -> None:
+    def unsubscribe(self, queue: Queue[Tuple[str, Dict[str, Any]]]) -> None:
         with self.lock:
             if queue in self.subscribers:
                 self.subscribers.remove(queue)
@@ -219,7 +251,8 @@ class CaptureManager:
         mode = str(payload.get("mode") or self.session["config"].get("mode") or "live")
         timestamp = str(payload.get("timestamp") or utc_now())
 
-        return {
+        event = dict(payload)
+        event.update({
             "id": f"evt-{self.sequence}",
             "timestamp": timestamp,
             "domain": domain,
@@ -235,7 +268,11 @@ class CaptureManager:
             "mode": mode,
             "confidence": str(payload.get("confidence") or "observed"),
             "source": str(payload.get("source") or "python-monitor"),
-        }
+        })
+        
+        if "kind" in event:
+            del event["kind"]
+        return event
 
     def _handle_monitor_payload(self, payload: Dict[str, Any]) -> None:
         kind = payload.get("kind")
@@ -265,8 +302,14 @@ class CaptureManager:
 
         if kind == "status":
             note = str(payload.get("note") or "").strip()
-            status = str(payload.get("status") or "running").strip() or "running"
+            reported_status = str(payload.get("status") or "running").strip() or "running"
             with self.lock:
+                status = reported_status
+                process = self.process
+                process_running = process is not None and process.poll() is None
+                if reported_status in {"completed", "stopped", "interrupted"} and process_running:
+                    # Avoid a short-lived terminal status while the subprocess is still winding down.
+                    status = "stopping" if self.stop_requested or self.session.get("status") == "stopping" else "running"
                 self.session["status"] = status
                 if payload.get("tool"):
                     self.session["tool"] = payload["tool"]
@@ -287,7 +330,7 @@ class CaptureManager:
             self._broadcast("session", payload_data)
 
     def _build_command(self, config: Dict[str, Any]) -> List[str]:
-        cmd = [
+        cmd: List[str] = [
             sys.executable,
             str(self.monitor_script),
             "--mode",
@@ -308,10 +351,29 @@ class CaptureManager:
             cmd.extend(["--mongo-uri", config["mongoUri"]])
         if config["limit"]:
             cmd.extend(["--limit", str(config["limit"])])
+        if config.get("sinkholeIp"):
+            cmd.extend(["--sinkhole-ip", config["sinkholeIp"]])
+        if config.get("scanTarget"):
+            cmd.extend(["--scan-target", config["scanTarget"]])
 
         return cmd
 
-    def _consume_stderr(self, process: subprocess.Popen) -> None:
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        try:
+            if psutil is not None:
+                parent = psutil.Process(process.pid)
+                for child in parent.children(recursive=True):
+                    child.terminate()
+                parent.terminate()
+            else:
+                process.terminate()
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _consume_stderr(self, process: subprocess.Popen[str]) -> None:
         stderr = process.stderr
         if not stderr:
             return
@@ -326,7 +388,7 @@ class CaptureManager:
             self._broadcast("session", payload)
 
     def _run_capture(self, config: Dict[str, Any]) -> None:
-        process: Optional[subprocess.Popen] = None
+        process: Optional[subprocess.Popen[str]] = None
         stderr_thread: Optional[threading.Thread] = None
         return_code = 1
 
@@ -339,11 +401,19 @@ class CaptureManager:
                 text=True,
                 bufsize=1,
             )
+            stop_requested = False
             with self.lock:
                 self.process = process
                 self.session["note"] = "DNS monitor subprocess started."
+                stop_requested = self.stop_requested
+                if stop_requested and self.session.get("status") != "error":
+                    self.session["status"] = "stopping"
+                    self.session["note"] = "Stop requested. Waiting for the monitor to shut down."
                 payload = self._session_payload_locked()
             self._broadcast("session", payload)
+
+            if stop_requested and process.poll() is None:
+                self._terminate_process(process)
 
             stderr_thread = threading.Thread(target=self._consume_stderr, args=(process,), daemon=True)
             stderr_thread.start()
@@ -386,9 +456,15 @@ class CaptureManager:
             if stderr_thread:
                 stderr_thread.join(timeout=1.5)
             with self.lock:
-                active_process = self.process
-                if active_process is process:
-                    self.process = None
+                if not self.process:
+                    pass
+                else:
+                    active_process = self.process
+                    if active_process is process:
+                        self.process = None
+                worker = self.worker
+                if worker is threading.current_thread():
+                    self.worker = None
 
                 if self.stop_requested and self.session.get("status") != "error":
                     self.session["status"] = "stopped"
@@ -402,6 +478,8 @@ class CaptureManager:
                     )
 
                 self.session["endedAt"] = utc_now()
+                self.history.insert(0, self._copy_session_locked())
+                self._save_history()
                 self.stop_requested = False
                 payload = self._session_payload_locked()
             self._broadcast("session", payload)
@@ -415,23 +493,33 @@ class CaptureManager:
         config["mongoUri"] = str(payload.get("mongoUri") or "").strip()
         config["mongoDb"] = str(payload.get("mongoDb") or config["mongoDb"]).strip() or config["mongoDb"]
         config["mongoCollection"] = str(payload.get("mongoCollection") or config["mongoCollection"]).strip() or config["mongoCollection"]
+        config["sinkholeIp"] = str(payload.get("sinkholeIp") or "").strip()
+        config["scanTarget"] = str(payload.get("scanTarget") or "").strip()
 
         try:
             config["limit"] = max(int(payload.get("limit") or 0), 0)
         except (TypeError, ValueError) as exc:
             raise ValueError("Event limit must be a non-negative integer.") from exc
 
-        if config["mode"] not in {"live", "manual"}:
-            raise ValueError("Mode must be live or manual.")
+        if config["mode"] not in {"live", "manual", "scan"}:
+            raise ValueError("Mode must be live, manual, or scan.")
         if config["preferredTool"] not in {"auto", "scapy", "tshark"}:
             raise ValueError("Preferred tool must be auto, scapy, or tshark.")
         if config["mode"] == "manual" and not config["pcapPath"]:
             raise ValueError("Manual mode requires a PCAP path.")
+        if config["mode"] == "scan" and not config["scanTarget"]:
+            raise ValueError("Scan mode requires a target IP or CIDR.")
         if config["mode"] == "manual":
             expanded_pcap = Path(config["pcapPath"]).expanduser()
             if not expanded_pcap.exists():
                 raise ValueError("The selected PCAP file does not exist.")
             config["pcapPath"] = str(expanded_pcap)
+        
+        # If interface is 'auto' or empty, we attempt to pick the best default later
+        # But we'll at least normalize it
+        if config["interface"].lower() in {"auto", ""}:
+            config["interface"] = ""
+
         if not self.monitor_script.exists():
             raise ValueError("Monitor script is missing from scripts/dns_monitor.py.")
 
@@ -458,7 +546,7 @@ class CaptureManager:
             self._add_activity_locked("Preparing DNS capture.", "info")
             self.worker = threading.Thread(target=self._run_capture, args=(config,), daemon=True)
             worker = self.worker
-            if worker is not None:
+            if worker is not None:  # type: ignore[condition]
                 worker.start()
             payload_data = self._session_payload_locked()
 
@@ -466,7 +554,8 @@ class CaptureManager:
         return payload_data
 
     def stop(self) -> Tuple[Dict[str, Any], bool]:
-        process: Optional[subprocess.Popen] = None
+        process: Optional[subprocess.Popen[str]] = None
+        accepted = False
         with self.lock:
             proc_obj = self.process
             if proc_obj is not None and proc_obj.poll() is None:
@@ -475,6 +564,13 @@ class CaptureManager:
                 self.session["note"] = "Stop requested. Waiting for the monitor to shut down."
                 self._add_activity_locked(self.session["note"], "warning")
                 process = self.process
+                accepted = True
+            elif self.session.get("status") in self.ACTIVE_STATES and self.worker is not None and self.worker.is_alive():
+                self.stop_requested = True
+                self.session["status"] = "stopping"
+                self.session["note"] = "Stop requested. Waiting for the monitor to shut down."
+                self._add_activity_locked(self.session["note"], "warning")
+                accepted = True
             else:
                 if self.session.get("status") in self.ACTIVE_STATES:
                     self.session["status"] = "completed"
@@ -485,7 +581,7 @@ class CaptureManager:
 
         if process:
             try:
-                process.terminate()
+                self._terminate_process(process)
             except Exception as exc:
                 with self.lock:
                     self.session["status"] = "error"
@@ -494,7 +590,7 @@ class CaptureManager:
                     payload = self._session_payload_locked()
 
         self._broadcast("session", payload)
-        return payload, process is not None
+        return payload, accepted
 
 
 def create_app() -> Flask:
@@ -504,21 +600,21 @@ def create_app() -> Flask:
     app.config["capture_manager"] = manager
 
     @app.route("/")
-    def index() -> Any:
-        return app.send_static_file("index.html")
+    def index() -> Any:  # type: ignore[misc]
+        return send_from_directory(PUBLIC_DIR, "index.html")
 
     @app.route("/health")
-    def health() -> Any:
+    def health() -> Any:  # type: ignore[misc]
         return jsonify({"status": "ok", "timestamp": utc_now()})
 
     @app.route("/api/dns-data")
-    def dns_data() -> Any:
+    def dns_data() -> Any:  # type: ignore[misc]
         search = request.args.get("search", "", type=str)
         limit = request.args.get("limit", 0, type=int)
         return jsonify(manager.snapshot(search=search, limit=limit))
 
     @app.route("/api/capture-status")
-    def capture_status() -> Any:
+    def capture_status() -> Any:  # type: ignore[misc]
         snapshot = manager.snapshot(limit=0)
         return jsonify(
             {
@@ -528,8 +624,8 @@ def create_app() -> Flask:
         )
 
     @app.route("/api/capture/start", methods=["POST"])
-    def capture_start() -> Any:
-        payload = request.get_json(silent=True) or {}
+    def capture_start() -> Any:  # type: ignore[misc]
+        payload = cast(Dict[str, Any], request.get_json(silent=True) or {})
         try:
             session_payload = manager.start(payload)
             return jsonify(session_payload), 202
@@ -538,12 +634,12 @@ def create_app() -> Flask:
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
 
-    @app.errorhandler(413)
-    def request_entity_too_large(error):
+    @app.errorhandler(413)  # type: ignore[assignment]
+    def request_entity_too_large(error: Any) -> Tuple[Any, int]:  # type: ignore[misc]
         return jsonify({"error": "File is too large. Maximum size is 50MB."}), 413
 
     @app.route("/api/upload-pcap", methods=["POST"])
-    def upload_pcap() -> Any:
+    def upload_pcap() -> Any:  # type: ignore[misc]
         try:
             if "pcap" not in request.files:
                 return jsonify({"error": "No file part named 'pcap' found in the request."}), 400
@@ -564,19 +660,56 @@ def create_app() -> Flask:
             return jsonify({
                 "pcapPath": str(save_path),
                 "filename": filename,
-                "size": os.path.getsize(save_path)
+                "size": save_path.stat().st_size
             }), 201
         except Exception as e:
             app.logger.error(f"Upload error: {e}")
             return jsonify({"error": f"An unexpected error occurred while saving the file: {str(e)}"}), 500
 
     @app.route("/api/capture/stop", methods=["POST"])
-    def capture_stop() -> Any:
+    def capture_stop() -> Any:  # type: ignore[misc]
         payload, stopped = manager.stop()
         return jsonify(payload), 200 if stopped else 409
 
+    @app.route("/api/history")
+    def get_history() -> Any:  # type: ignore[misc]
+        return jsonify(manager.history)
+
+    @app.route("/api/reset", methods=["POST"])
+    def reset_dashboard() -> Any:  # type: ignore[misc]
+        return jsonify(manager.reset_dashboard())
+
+    @app.route("/api/interfaces")
+    def get_interfaces() -> Any:  # type: ignore[misc]
+        """List available network interfaces for capture."""
+        interfaces: List[str] = []
+        try:
+            if sys.platform == "win32":
+                # Fallback to netsh if psutil is not available
+                output = subprocess.check_output(["netsh", "interface", "show", "interface"], text=True)
+                for line in output.splitlines():
+                    if "Enabled" in line and "Connected" in line:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            name = " ".join(parts[3:])
+                            interfaces.append(str(name))
+            else:
+                if psutil:
+                    interfaces = list(psutil.net_if_addrs().keys())
+                else:
+                    # Generic fallback for unix
+                    output = subprocess.check_output(["ip", "link", "show"], text=True)
+                    # simplified parsing
+                    import re
+                    interfaces = re.findall(r"^\d+: ([^:@]+)", output, re.MULTILINE)
+        except Exception:
+            pass
+        
+        # Always include 'auto'
+        return jsonify(list(set(["auto"] + interfaces)))
+
     @app.route("/api/stream")
-    def stream() -> Response:
+    def stream() -> Response:  # type: ignore[misc]
         queue = manager.subscribe()
 
         def event_stream():

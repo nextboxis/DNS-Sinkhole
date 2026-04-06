@@ -11,11 +11,9 @@
 
 **Advanced Real-Time DNS Telemetry & Threat Surveillance Console**
 
-<div align="center">
-
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-cyan?style=for-the-badge&logo=python&logoColor=white)](#)
 [![Flask Backend](https://img.shields.io/badge/Flask-Backend-00e676?style=for-the-badge&logo=flask&logoColor=black)](#)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Persistance-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](#)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Persistence-47A248?style=for-the-badge&logo=mongodb&logoColor=white)](#)
 [![Scapy/TShark](https://img.shields.io/badge/Packet_Engine-Scapy_|_TShark-ff2a2a?style=for-the-badge&logo=wireshark&logoColor=white)](#)
 [![Static Typing](https://img.shields.io/badge/Typing-Pyre_Strict-purple?style=for-the-badge&logo=python&logoColor=white)](#)
 
@@ -26,6 +24,7 @@
 <p align="center">
   <i>DNS Sinkhole provides a premium, tactical control surface for intercepting, analyzing, and persisting live DNS traffic telemetry and malicious PCAP artifacts.</i>
 </p>
+
 ---
 
 ## ⚡ System Capabilities
@@ -72,7 +71,7 @@ The frontend is a hacker-themed, hardware-accelerated SPA featuring:
 
 ### 1. Initialize Workspace
 ```bash
-git clone https://github.com/nextboxis/DNS-sinkhole.git
+git clone https://github.com/your-username/DNS-sinkhole.git
 cd DNS-sinkhole
 ```
 
@@ -160,18 +159,18 @@ python scripts/dns_monitor.py \
 
 ```mermaid
 graph TD
-    subgraph "Frontend Interface (Glassmorphism SPA)"
+    subgraph frontend ["Frontend Interface (Glassmorphism SPA)"]
         UI[Browser Dashboard]
         EXP[Selective Data Export]
         SSE_R[SSE Receiver]
     end
 
-    subgraph "Backend Engine (Flask/Pyre Strict)"
+    subgraph backend ["Backend Engine (Flask/Pyre Strict)"]
         APP[app.py Manager]
         MON[dns_monitor.py]
     end
 
-    subgraph "Data & Traffic Layer"
+    subgraph data ["Data & Traffic Layer"]
         DB[(MongoDB)]
         SNIFF{BPF Filter}
         PCAP[(PCAP/PCAPNG)]
