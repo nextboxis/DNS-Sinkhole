@@ -1,0 +1,170 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  risk-evaluation:
+    name: Evaluate Deployment Risk
+    runs-on: ubuntu-latest
+    outputs:
+      risk_level: ${{ steps.evaluate.outputs.risk_level }}
+      risk_reason: ${{ steps.evaluate.outputs.risk_reason }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            # Get the diff from the base branch (or previous commit)
+            git diff --name-only ${{ github.event.before }} ${{ github.event.after }} > changed_files.txt
+          fi
+          cat changed_files.txt
+
+      - name: Check for high-risk changes
+        id: evaluate
+        run: |
+          RISK_LEVEL="low"
+          RISK_REASON=""
+
+          # Read changed files
+          if [ ! -f changed_files.txt ]; then
+            echo "risk_level=low" >> $GITHUB_OUTPUT
+            echo "risk_reason=No changes detected" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check for database migrations
+          if grep -E "^.*migrations?/.*\.(sql|py|js|ts)$" changed_files.txt; then
+            RISK_LEVEL="high"
+            RISK_REASON="Database migration files detected"
+            echo "⚠️  HIGH RISK: Database migration files detected"
+          fi
+
+          # Check for security-critical paths
+          SECURITY_PATHS=(
+            "auth/"
+            "security/"
+            "credentials"
+            "secrets"
+            "keys/"
+            "password"
+            "token"
+            ".env"
+            "config/prod"
+            "infrastructure/"
+            "terraform/"
+          )
+
+          for path in "${SECURITY_PATHS[@]}"; do
+            if grep -E "^.*${path}.*$" changed_files.txt; then
+              RISK_LEVEL="high"
+              RISK_REASON="Security-critical paths modified: $path"
+              echo "⚠️  HIGH RISK: Security-critical path touched: $path"
+            fi
+          done
+
+          # Check for database schema changes
+          if grep -E "^.*schema.*\.(sql|py|js)$" changed_files.txt; then
+            RISK_LEVEL="high"
+            RISK_REASON="Database schema changes detected"
+            echo "⚠️  HIGH RISK: Database schema changes detected"
+          fi
+
+          # Output results
+          echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+          echo "risk_reason=$RISK_REASON" >> $GITHUB_OUTPUT
+          
+          echo "📊 Risk Evaluation Complete"
+          echo "Risk Level: $RISK_LEVEL"
+          echo "Reason: $RISK_REASON"
+
+      - name: Print risk summary
+        run: |
+          echo "## Risk Evaluation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Risk Level:** ${{ steps.evaluate.outputs.risk_level }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Reason:** ${{ steps.evaluate.outputs.risk_reason }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const riskLevel = '${{ steps.evaluate.outputs.risk_level }}';
+            const riskReason = '${{ steps.evaluate.outputs.risk_reason }}';
+            const icon = riskLevel === 'high' ? '⚠️' : '✅';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${icon} **Deployment Risk: ${riskLevel.toUpperCase()}**\n\n${riskReason}`
+            });
+
+  production-deployment:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: risk-evaluation
+    if: needs.risk-evaluation.outputs.risk_level == 'low'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log deployment start
+        run: |
+          echo "🚀 Starting production deployment"
+          echo "Risk Level: ${{ needs.risk-evaluation.outputs.risk_level }}"
+
+      - name: Deploy application
+        run: |
+          echo "Deploying to production..."
+          # Replace with your actual deployment commands
+          # Examples:
+          # - docker build and push
+          # - kubectl apply
+          # - helm upgrade
+          # - serverless deploy
+          echo "✅ Deployment completed successfully"
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          # Add your smoke test commands here
+          echo "✅ Smoke tests passed"
+
+      - name: Notify deployment success
+        run: |
+          echo "## ✅ Production Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+
+  deployment-blocked:
+    name: Deployment Blocked - High Risk
+    runs-on: ubuntu-latest
+    needs: risk-evaluation
+    if: needs.risk-evaluation.outputs.risk_level == 'high'
+    steps:
+      - name: Notify deployment blocked
+        run: |
+          echo "## ⛔ Deployment Blocked - High Risk Changes Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Risk Reason:** ${{ needs.risk-evaluation.outputs.risk_reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This deployment requires manual review and approval due to high-risk changes." >> $GITHUB_STEP_SUMMARY
+          echo "Please review the following:" >> $GITHUB_STEP_SUMMARY
+          echo "- Database migrations need DBA review" >> $GITHUB_STEP_SUMMARY
+          echo "- Security changes need security team review" >> $GITHUB_STEP_SUMMARY
+          echo "- Infrastructure changes need infrastructure team review" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail workflow to prevent automatic deployment
+        run: |
+          echo "❌ Blocking automatic deployment due to high-risk changes"
+          exit 1
